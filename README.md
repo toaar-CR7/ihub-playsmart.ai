@@ -20,13 +20,13 @@ The AI fuses both to understand a player’s motion *and* communicate advice eff
 
 ---
 
-## 🧩 Features
-- 🎥 **Pose Analysis:** Detects body angles and movements using MediaPipe/OpenCV  
-- 💬 **Smart Feedback:** Generates natural, human-style text guidance  
-- ⚽ **Skill Modules:** Shooting, Passing, Defending, Positioning  
-- 📊 **Visual Insights:** Shows overlays and progress charts  
-- 📅 **Custom Training Schedule:** Builds routines based on available time  
-- 🌐 **Multilingual Support (Coming Soon):** Feedback in Hindi, Tamil, Bengali & more  
+##  Features
+-  **Pose Analysis:** Detects body angles and movements using MediaPipe/OpenCV  
+-  **Smart Feedback:** Generates natural, human-style text guidance  
+-  **Skill Modules:** Shooting, Passing, Defending, Positioning  
+-  **Visual Insights:** Shows overlays and progress charts  
+-  **Custom Training Schedule:** Builds routines based on available time  
+-  **Multilingual Support (Coming Soon):** Feedback in Hindi, Tamil, Bengali & more  
 
 ---
 
@@ -39,8 +39,8 @@ The AI fuses both to understand a player’s motion *and* communicate advice eff
 
 ---
 
-## 🌐 How to use
+##  How to use
 
 1. Open your browser (Chrome/Edge/Firefox recommended).  
-2. Go to the app link: **[PlaySmart AI Football Coach](https://claude.ai/public/artifacts/4c8bc088-82fa-48ac-a6cd-5a7709c36b82)**  
+2. Go to the app link:(https://claude.ai/public/artifacts/1f0f1492-c407-40ba-875b-07a807d55063)  
 3. Start training, analyzing, and improving your football skills with AI guidance!  
