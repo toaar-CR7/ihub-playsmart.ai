@@ -37,7 +37,7 @@ A built-in **AI Chat Coach** (Gemini API powered) answers natural language queri
 
 ---
 
-## Technical Stack
+### Technical Stack
 
 | Component | Technology |
 |------------|-------------|
@@ -49,7 +49,7 @@ A built-in **AI Chat Coach** (Gemini API powered) answers natural language queri
 
 ---
 
-## How It Works
+### How It Works
 1. Upload a video and select 3–5 keyframes of a football skill.  
 2. The Gemini AI performs **sequential biomechanical analysis**.  
 3. The system provides **scores**, **error detection**, and **drill recommendations**.  
@@ -57,5 +57,8 @@ A built-in **AI Chat Coach** (Gemini API powered) answers natural language queri
 5. Performance scores are **stored locally** for visual progress tracking.
 
 ---
+### The link of the website:
+you can try the app out for yourself here:
+https://playsmartfootball.netlify.app/
 
 
