@@ -1,46 +1,61 @@
-# ⚽ PlaySmart: AI Football Trainer 
- ~by The hackers of GE
+# PlaySmart AI Football Coach
 
-### Train Smart. Play Great.
-
----
-
-## Overview
-**PlaySmart** is a **multimodal AI football online coaching web app** created by our group The hackers of GE with the help of claude AI that helps aspiring players and late starters train like professionals from home — no expensive academy required.  
-It combines **computer vision**  and **language intelligence**  to analyze player movements, detect technique errors, and provide personalized feedback instantly to proveide begginers with a great start and a faster way to improve rather than the traditional academy methods as the basics need to be perfectly groomed for a good career.
+This repository contains the source code for **PlaySmart AI Football Coach**, a **multimodal web application** built with **React** and **Tailwind CSS**.  
+The app analyzes user-uploaded video keyframes to provide **expert biomechanical feedback**, **track skill progression**, and **generate personalized weekly training schedules** — all powered by the **Gemini API**.
 
 ---
 
-## What Makes It Multimodal
-PlaySmart processes **two distinct types of data**:
-- 🎥 **Visual Modality:** Player’s training video (analyzed with MediaPipe Pose)
-- 💬 **Language Modality:** AI-generated natural feedback & improvement drills
+## Key Features
 
-The AI fuses both to understand a player’s motion *and* communicate advice effectively — making it a **true multimodal AI system**.
+### Multimodal Analysis
+Upload a football training video and capture **3–5 keyframes** of a specific action (e.g., Shooting, Passing, Defending).  
+These images are processed sequentially by the AI for detailed biomechanical analysis.
+
+### Harsh Critique AI
+The **Gemini API** acts as a **world-class, harsh football coach**, providing:
+- A **score (0–100)** for each skill execution  
+- Precise feedback on technical issues (e.g., _“Plant foot 5cm too far”_)  
+- Specific correction advice
+
+### Personalized Training
+Detected issues are automatically mapped to **recommended drills** (e.g., “Drill 1 – 15 mins”)  
+All drills are stored locally in a persistent **Drill Bank**.
+
+### Dynamic Scheduling
+The **Schedule Tab** generates a **weekly training plan** based on:
+- The user’s available hours  
+- The AI-identified weak points and related drills  
+
+### progress Tracking
+Scores for each sub-skill (e.g., *Power Shot*, *Finesse*) are saved locally, allowing players to **track progress** over time.
+
+### AI Coach Chat
+A built-in **AI Chat Coach** (Gemini API powered) answers natural language queries about:
+- Training drills  
+- Football rules  
+- Technical improvements  
 
 ---
 
-##  Features
--  **Pose Analysis:** Detects body angles and movements using MediaPipe/OpenCV  
--  **Smart Feedback:** Generates natural, human-style text guidance  
--  **Skill Modules:** Shooting, Passing, Defending, Positioning  
--  **Visual Insights:** Shows overlays and progress charts  
--  **Custom Training Schedule:** Builds routines based on available time  
--  **Multilingual Support (Coming Soon):** Feedback in Hindi, Tamil, Bengali & more  
+## Technical Stack
+
+| Component | Technology |
+|------------|-------------|
+| **Frontend** | React (Functional Components + Hooks) |
+| **Styling** | Tailwind CSS |
+| **Bundler** | Vite |
+| **AI Backend** | Google Gemini API *(gemini-2.5-flash-preview-09-2025)* |
+| **Function** | Multimodal (Vision + Text) generation using structured JSON output |
 
 ---
 
-### ⚡ Behind the scenes (for curious devs)
-
-- **Frontend:** Built with Node.js (React/Vue).  
-- **Backend:** Python server handles AI inference.  
-- **AI models:** Multimodal models handle images, videos, and text for holistic football coaching.  
-- **Continuous updates:** New drills, languages, and features are added automatically online.  
+## How It Works
+1. Upload a video and select 3–5 keyframes of a football skill.  
+2. The Gemini AI performs **sequential biomechanical analysis**.  
+3. The system provides **scores**, **error detection**, and **drill recommendations**.  
+4. Training schedules are **auto-generated** weekly based on user time input.  
+5. Performance scores are **stored locally** for visual progress tracking.
 
 ---
 
-##  How to use
 
-1. Open your browser (Chrome/Edge/Firefox recommended).  
-2. Go to the app link:(https://claude.ai/public/artifacts/1f0f1492-c407-40ba-875b-07a807d55063)  
-3. Start training, analyzing, and improving your football skills with AI guidance!  
