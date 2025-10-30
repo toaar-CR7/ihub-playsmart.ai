@@ -57,8 +57,9 @@ A built-in **AI Chat Coach** (Gemini API powered) answers natural language queri
 5. Performance scores are **stored locally** for visual progress tracking.
 
 ---
-### The link of the website:
-you can try the app out for yourself here:
-https://playsmartfootball.netlify.app/
+### Implementation
+1. Locate to the directory.
+2. Run the command "npm run dev".
+3. Open "localost:5173" in the browser
 
 
