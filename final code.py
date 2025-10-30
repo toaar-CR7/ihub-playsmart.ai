@@ -4,11 +4,14 @@ import { Upload, Video, TrendingUp, Target, Shield, Users, Play, CheckCircle, Al
 
 /**
  * --- GEMINI API CALLER ---
+ * This function calls the Gemini API.
+ * It includes an empty API key (Canvas will handle it), error handling, and exponential backoff for retries.
  */
 const callGeminiAPI = async (payload, retries = 3, delay = 1000) => {
   const apiKey = ""; // Leave this empty. Canvas will handle it.
   const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
 
+  // Retry loop for API call robustness
   for (let i = 0; i < retries; i++) {
     try {
       const response = await fetch(apiUrl, {
@@ -18,31 +21,71 @@ const callGeminiAPI = async (payload, retries = 3, delay = 1000) => {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+           let errorBodyText = await response.text();
+           console.error("API Error Body:", errorBodyText);
+           let specificError = `HTTP error! status: ${response.status}`;
+           try {
+               const errorJson = JSON.parse(errorBodyText);
+               if (errorJson?.error?.message) {
+                   specificError += `, message: ${errorJson.error.message}`;
+               } else { specificError += `, message: ${errorBodyText.substring(0,200)}`; }
+           } catch { specificError += `, message: ${errorBodyText.substring(0,200)}`; }
+           throw new Error(specificError);
       }
+
 
       const result = await response.json();
       const candidate = result.candidates?.[0];
 
-      if (candidate && candidate.content?.parts?.[0]?.text) {
-        return candidate.content.parts[0].text;
-      } else {
+       // Check finish reason for safety or other issues
+      if (candidate?.finishReason && candidate.finishReason !== "STOP" && candidate.finishReason !== "MAX_TOKENS") { // Allow MAX_TOKENS
+          console.warn("API call finished with reason:", candidate.finishReason);
+           if (candidate.finishReason === "SAFETY") {
+               throw new Error("AI response blocked due to safety settings.");
+           }
+            // Handle other non-STOP reasons if necessary
+            throw new Error(`AI processing stopped unexpectedly: ${candidate.finishReason}`);
+      }
+
+      // Check for actual text content
+      if (candidate?.content?.parts?.[0]?.text) {
+        return candidate.content.parts[0].text; // Success
+      }
+      // If no text, but finished, it's potentially an issue (e.g., asked for JSON but didn't get it)
+      else if (candidate?.finishReason) {
+           console.error('API finished but no text content found:', result);
+           throw new Error(`API finished with reason ${candidate.finishReason} but returned no text.`);
+      }
+      // Otherwise, invalid structure
+      else {
         console.error('Invalid response structure:', result);
         throw new Error('Invalid response structure from API.');
       }
 
+
     } catch (error) {
       console.error(`Attempt ${i + 1} failed:`, error);
-      if (i === retries - 1) {
-        return `Error: Unable to get response from AI. ${error.message}`;
+      if (i === retries - 1) { // Last retry failed
+        // Return a user-friendly error string instead of throwing
+        let displayError = error.message;
+        if (error.message.includes("safety settings")) { displayError = "Response blocked (safety)."; }
+        else if (error.message.includes("Invalid response structure")) { displayError = "Unexpected response format."; }
+        else if (error instanceof TypeError && error.message.includes('fetch')) { displayError = "Network error."; }
+        else if (error.message.includes("returned no text")) { displayError = "AI returned empty response.";}
+        return `Error: API Call Failed. ${displayError}`; // Return error string
       }
+      // Wait longer before the next retry
       await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
     }
   }
+   // Fallback error if loop finishes unexpectedly
+   return "Error: API call failed after multiple retries.";
 };
+
 
 /**
  * --- HELPER FUNCTION: FILE TO BASE64 ---
+ * Converts an image file into a base64 string to send to the API.
  */
 const convertFileToBase64 = (file) => {
   return new Promise((resolve, reject) => {
@@ -55,6 +98,10 @@ const convertFileToBase64 = (file) => {
 
 // --- SYSTEM PROMPTS ---
 
+/**
+ * --- AI COACH SYSTEM PROMPT ---
+ * Instructions for the general AI chatbot.
+ */
 const AI_COACH_SYSTEM_PROMPT = `
 You are "Coach AI," an expert football coach and tactician. Your personality is encouraging, clear, and professional.
 Your mission is to help coaches, players, and fans understand football. You must provide safe, practical, and well-explained advice.
@@ -65,10 +112,14 @@ RULES:
 4. Keep your answers concise and easy to read on a mobile phone (under 150 words).
 `;
 
+/**
+ * --- AI ANALYSIS SYSTEM PROMPT ---
+ * Dynamically generated instructions for the image analysis AI.
+ */
 const AI_ANALYSIS_SYSTEM_PROMPT = (skillCategory, skillName) => {
   let frameDescriptions = '';
   let skillSpecificInstruction = '';
-  const lowerSkillName = skillName.toLowerCase();
+  const lowerSkillName = skillName ? skillName.toLowerCase() : ''; // Add null check
 
   // 1. DYNAMIC FRAME DESCRIPTIONS
   if (skillCategory === 'shooting' || skillCategory === 'passing') {
@@ -114,7 +165,7 @@ SPECIAL INSTRUCTION FOR POSITIONING: Focus on awareness. Is the player scanning?
 You are a harsh, world-class critic and AI football analyst.
 Your job is to be extremely strict with your scoring. A score of 50-60 is for an average amateur. A score of 70-80 is for a top-tier amateur. A score of 90+ is for a world-class professional. **Do not give high scores easily.** Find the flaws.
 
-You are analyzing a "${skillName}".
+You are analyzing a "${skillName || 'selected skill'}".
 ${frameDescriptions}
 
 Analyze the *entire motion* across all images. Identify issues in the sequence.
@@ -122,29 +173,57 @@ Provide one, consolidated report.
 
 ${skillSpecificInstruction}
 
-You MUST respond *only* with a valid JSON object. Do not add "json" or backticks.
+You MUST respond *only* with a valid JSON object adhering precisely to the schema provided. Do not add "json" markdown tags or backticks around the JSON. Do not add any text before or after the JSON object.
 The JSON must match this exact schema:
 {
-  "score": number, // Your HARSH score (0-100) for the *entire* technique
-  "proScore": number, // A professional score (e.g., 90-95)
-  "issues": [ { "severity": "high" | "medium" | "low", "issue": "Specific issue you see (e.g., 'Plant foot too far in Frame 2')", "fix": "Specific correction" } ],
-  "strengths": [ "Strength 1 (e.g., 'Good body shape in Frame 1')", "Strength 2" ],
-  "drills": [
-    { "drill": "Drill 1 description", "duration": 15 }, // Duration in minutes
-    { "drill": "Drill 2 description", "duration": 20 }  // Duration in minutes
-  ]
+  "type": "object",
+  "properties": {
+    "score": { "type": "number", "description": "Your HARSH score (0-100) for the *entire* technique" },
+    "proScore": { "type": "number", "description": "A professional score (e.g., 90-95)" },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+          "issue": { "type": "string", "minLength": 1, "description": "Specific issue you see (e.g., 'Plant foot too far in Frame 2')" },
+          "fix": { "type": "string", "minLength": 1, "description": "Specific correction" }
+        },
+        "required": ["severity", "issue", "fix"]
+      }
+    },
+    "strengths": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "description": "Strength (e.g., 'Good body shape in Frame 1')" }
+    },
+    "drills": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "drill": { "type": "string", "minLength": 1, "description": "Drill description" },
+          "duration": { "type": "number", "description": "Duration in minutes" }
+        },
+        "required": ["drill", "duration"]
+      }
+    }
+  },
+  "required": ["score", "proScore", "issues", "strengths", "drills"]
 }
 
-IMPORTANT: You **must** provide at least one 'issue'. If the form is near-perfect, find a minor, subtle point for improvement. For 'strengths', be critical: **only list 1-2 *clear* and *significant* strengths**. Do not list basic things. **Do not** return an empty array for 'issues'.
 
---- NEW CRITICAL RULE ---
-The "issue" and "fix" strings inside the 'issues' array **MUST NOT be empty strings (""), null, or whitespace-only strings.** They must contain descriptive, helpful text.
-The "strength" strings inside the 'strengths' array **MUST NOT be empty strings (""), null, or whitespace-only strings.**
-The "drill" strings inside the 'drills' array **MUST NOT be empty strings (""), null, or whitespace-only strings.**
+IMPORTANT RULES FOR YOUR RESPONSE:
+1.  **Strict JSON:** Output *only* the JSON object defined above. No extra text, explanations, or formatting.
+2.  **At least one issue:** You **must** provide at least one item in the 'issues' array. Find a flaw, even a minor one.
+3.  **Limited Strengths:** Only list 1-2 *clear* and *significant* strengths in the 'strengths' array. Be critical.
+4.  **No Empty Strings:** All strings ("issue", "fix", "strength", "drill") **must** contain meaningful text. Do not return empty strings ("") or whitespace-only strings.
 `;
 };
 
-// --- ANALYSIS_RESPONSE_SCHEMA ---
+/**
+ * --- AI ANALYSIS JSON SCHEMA ---
+ * Defines the expected structure for the AI's analysis response.
+ */
 const ANALYSIS_RESPONSE_SCHEMA = {
   type: "OBJECT",
   properties: {
@@ -155,24 +234,26 @@ const ANALYSIS_RESPONSE_SCHEMA = {
       "items": {
         "type": "OBJECT",
         "properties": {
-          "severity": { "type": "STRING" },
-          "issue": { "type": "STRING", "minLength": 1 }, // <-- THE FIX
-          "fix": { "type": "STRING", "minLength": 1 }   // <-- THE FIX
-        }
+          "severity": { "type": "STRING", "enum": ["high", "medium", "low"] }, // Added enum validation
+          "issue": { "type": "STRING", "minLength": 1 },
+          "fix": { "type": "STRING", "minLength": 1 }
+        },
+        "required": ["severity", "issue", "fix"]
       }
     },
     "strengths": {
       "type": "ARRAY",
-      "items": { "type": "STRING", "minLength": 1 } // <-- THE FIX
+      "items": { "type": "STRING", "minLength": 1 }
     },
     "drills": {
       "type": "ARRAY",
       "items": {
         "type": "OBJECT",
         "properties": {
-          "drill": { "type": "STRING", "minLength": 1 }, // <-- THE FIX
+          "drill": { "type": "STRING", "minLength": 1 },
           "duration": { "type": "NUMBER" }
-        }
+        },
+        "required": ["drill", "duration"]
       }
     }
   },
@@ -181,23 +262,24 @@ const ANALYSIS_RESPONSE_SCHEMA = {
 
 /**
  * --- MODAL COMPONENT ---
+ * A simple popup modal for showing errors or notifications.
  */
 const Modal = ({ message, onClose }) => {
   if (!message) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 max-w-sm w-full">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 transition-opacity duration-200 opacity-100"> {/* Default visible */}
+      <div className="bg-slate-800 rounded-xl p-6 border border-slate-700 max-w-sm w-full shadow-xl transform transition-transform duration-200 scale-100"> {/* Default visible */}
         <div className="flex justify-between items-center mb-4">
           <h3 className="text-lg font-bold text-white">Notification</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white">
+          <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
         <p className="text-gray-300 text-sm mb-6">{message}</p>
         <button
           onClick={onClose}
-          className="w-full bg-blue-600 text-white py-2 px-4 rounded-lg font-semibold hover:bg-blue-700 transition-all"
+          className="w-full bg-blue-600 text-white py-2.5 px-4 rounded-lg font-semibold hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-800 transition-all duration-150"
         >
           Close
         </button>
@@ -208,6 +290,8 @@ const Modal = ({ message, onClose }) => {
 
 
 // --- STATIC DATA (Used for UI rendering) ---
+
+// Skill categories, sub-skills, icons, and colors
 const skills = {
   shooting: {
     name: 'Shooting',
@@ -235,6 +319,7 @@ const skills = {
   }
 };
 
+// Maps sub-skill keys to human-readable names
 const subSkillNames = {
   power_shot: 'Power Shot', finesse: 'Finesse Shot', chip: 'Chip Shot', volley: 'Volley',
   bicycle: 'Bicycle Kick', penalty: 'Penalty', trivela: 'Trivela', free_kick: 'Free Kick',
@@ -246,6 +331,7 @@ const subSkillNames = {
   transition: 'Transition', shape: 'Team Shape'
 };
 
+// Maps skill categories to their specific keyframe labels (4 or 5)
 const keyframeLabelSets = {
   shooting: [
     "1. Approach",
@@ -275,6 +361,7 @@ const keyframeLabelSets = {
   ]
 };
 
+// Creates the default, empty structure for the progress tracker
 const getDefaultProgress = () => {
   const defaultData = {};
   for (const skillKey in skills) {
@@ -292,406 +379,400 @@ const getDefaultProgress = () => {
 };
 
 
-// --- *** THIS IS THE FINAL FIX *** ---
-// --- NEW: HELPER FUNCTION TO FIX BLANK AI RESPONSES ---
-// We will manually clean the AI's response to kill the "blank issue" bug.
+/**
+ * --- SANITIZER FUNCTION ---
+ * Manually cleans the AI's response to prevent errors from blank/invalid data.
+ */
 const sanitizeAnalysisData = (data) => {
-  // Create a copy to avoid modifying the original data unexpectedly
-  const cleanData = JSON.parse(JSON.stringify(data));
+    try {
+        if (typeof data !== 'object' || data === null) {
+            console.error("Invalid data object passed to sanitizeAnalysisData:", data);
+            return { score: 0, proScore: 90, issues: [], strengths: [], drills: [] };
+        }
+        const cleanData = {
+            score: typeof data.score === 'number' ? Math.max(0, Math.min(100, data.score)) : 0, // Clamp score
+            proScore: typeof data.proScore === 'number' ? data.proScore : 90,
+            issues: [], strengths: [], drills: [],
+        };
 
-  // 1. Clean Issues
-  if (cleanData.issues && Array.isArray(cleanData.issues)) {
-    cleanData.issues = cleanData.issues.filter(item =>
-      item.issue && item.issue.trim().length > 0 &&
-      item.fix && item.fix.trim().length > 0
-    );
-  } else {
-    cleanData.issues = [];
-  }
-
-  // 2. Clean Strengths
-  if (cleanData.strengths && Array.isArray(cleanData.strengths)) {
-    cleanData.strengths = cleanData.strengths.filter(strength =>
-      strength && strength.trim().length > 0
-    );
-  } else {
-    cleanData.strengths = [];
-  }
-
-  // 3. Clean Drills
-  if (cleanData.drills && Array.isArray(cleanData.drills)) {
-    cleanData.drills = cleanData.drills.filter(drillItem =>
-      drillItem.drill && drillItem.drill.trim().length > 0 && drillItem.duration
-    );
-  } else {
-    cleanData.drills = [];
-  }
-
-  return cleanData;
+        if (Array.isArray(data.issues)) {
+            cleanData.issues = data.issues.filter(item =>
+                item && typeof item === 'object' &&
+                typeof item.issue === 'string' && item.issue.trim().length > 0 &&
+                typeof item.fix === 'string' && item.fix.trim().length > 0 &&
+                typeof item.severity === 'string' && ['high', 'medium', 'low'].includes(item.severity.toLowerCase())
+            );
+        }
+        if (Array.isArray(data.strengths)) {
+            cleanData.strengths = data.strengths.filter(strength =>
+                typeof strength === 'string' && strength.trim().length > 0
+            );
+        }
+        if (Array.isArray(data.drills)) {
+            cleanData.drills = data.drills.filter(drillItem =>
+                drillItem && typeof drillItem === 'object' &&
+                typeof drillItem.drill === 'string' && drillItem.drill.trim().length > 0 &&
+                typeof drillItem.duration === 'number' && drillItem.duration > 0
+            );
+        }
+        // No longer adding placeholder issue here, let the UI handle empty display
+        return cleanData;
+    } catch (sanitizeError) {
+        console.error("Error during sanitization:", sanitizeError, "Original data:", data);
+        return { score: 0, proScore: 90, issues: [], strengths: [], drills: [] }; // Return default on error
+    }
 };
 
 
+/**
+ * --- MAIN APP COMPONENT ---
+ * This is the core of the application.
+ */
 const PlaySmart = () => {
+  // --- STATE MANAGEMENT ---
   const [activeTab, setActiveTab] = useState('upload');
   const [uploadedVideo, setUploadedVideo] = useState(null);
-
-  const [keyframes, setKeyframes] = useState({
-    frame1: null,
-    frame2: null,
-    frame3: null,
-    frame4: null,
-    frame5: null,
-  });
-
+  const [keyframes, setKeyframes] = useState({ frame1: null, frame2: null, frame3: null, frame4: null, frame5: null });
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisComplete, setAnalysisComplete] = useState(false);
-
   const [selectedSkill, setSelectedSkill] = useState(null);
   const [selectedSubSkill, setSelectedSubSkill] = useState(null);
-
   const [hoursPerWeek, setHoursPerWeek] = useState(5);
   const [chatMessages, setChatMessages] = useState([]);
   const [userMessage, setUserMessage] = useState('');
   const [currentAnalysis, setCurrentAnalysis] = useState(null);
   const [isAiTyping, setIsAiTyping] = useState(false);
   const [modalMessage, setModalMessage] = useState('');
-
   const [progressData, setProgressData] = useState(getDefaultProgress());
   const [trainingDrills, setTrainingDrills] = useState([]);
-  const [weeklySchedule, setWeeklySchedule] = useState([]);
-
+  const [weeklySchedule, setWeeklySchedule] = useState([]); // Use setWeeklySchedule to update
   const [keyframeLabels, setKeyframeLabels] = useState(keyframeLabelSets.shooting);
 
+  // --- REFS ---
   const fileInputRef = useRef(null);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-
   const chatEndRef = useRef(null);
 
+  // --- EFFECTS ---
+
+  // Auto-scroll chat
   useEffect(() => {
     if (chatEndRef.current) {
       chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [chatMessages]);
 
+  // Load data from localStorage on mount
   useEffect(() => {
-    // Load Progress
-    const savedProgress = localStorage.getItem('playSmartProgress');
-    if (savedProgress) {
-      const parsedProgress = JSON.parse(savedProgress);
-      const defaultData = getDefaultProgress();
-
-      for (const skillKey in defaultData) {
-        if (parsedProgress[skillKey]) {
-          for (const subSkillKey in defaultData[skillKey].subSkills) {
-            if (parsedProgress[skillKey].subSkills[subSkillKey]) {
-              defaultData[skillKey].subSkills[subSkillKey] = parsedProgress[skillKey].subSkills[subSkillKey];
-            }
-          }
+    try {
+        const savedProgress = localStorage.getItem('playSmartProgress');
+        if (savedProgress) {
+            const parsed = JSON.parse(savedProgress);
+            if (typeof parsed === 'object' && parsed !== null) {
+                // Safely merge with default structure
+                const defaultProg = getDefaultProgress();
+                for (const skillKey in defaultProg) {
+                    if (parsed[skillKey]?.subSkills) {
+                        for (const subSkillKey in defaultProg[skillKey].subSkills) {
+                            if (parsed[skillKey].subSkills[subSkillKey]?.current !== undefined) {
+                                defaultProg[skillKey].subSkills[subSkillKey] = parsed[skillKey].subSkills[subSkillKey];
+                            }
+                        }
+                    }
+                }
+                setProgressData(defaultProg);
+            } else { localStorage.removeItem('playSmartProgress'); }
         }
-      }
-      setProgressData(defaultData);
-    }
+    } catch (e) { console.error("Error loading progress:", e); localStorage.removeItem('playSmartProgress'); }
 
-    // Load Training Drills
-    const savedDrills = localStorage.getItem('playSmartTrainingDrills');
-    if (savedDrills) {
-      setTrainingDrills(JSON.parse(savedDrills));
-    }
-  }, []); // Empty array means this runs only once on mount
+    try {
+        const savedDrills = localStorage.getItem('playSmartTrainingDrills');
+        if (savedDrills) {
+            const parsed = JSON.parse(savedDrills);
+            if (Array.isArray(parsed)) {
+                setTrainingDrills(parsed.filter(d => d && d.drill && d.duration)); // Basic validation
+            } else { localStorage.removeItem('playSmartTrainingDrills'); }
+        }
+    } catch(e) { console.error("Error loading drills:", e); localStorage.removeItem('playSmartTrainingDrills'); }
+  }, []);
 
-  // Update logic when selectedSkill changes
+  // Reset UI elements when skill category changes
   useEffect(() => {
-    if (selectedSkill) {
+    if (selectedSkill && keyframeLabelSets[selectedSkill]) { // Check key exists
       setKeyframeLabels(keyframeLabelSets[selectedSkill]);
       setSelectedSubSkill(null);
       setUploadedVideo(null);
+      setAnalysisComplete(false); // Reset analysis status
+      setCurrentAnalysis(null); // Clear previous analysis data
       setKeyframes({ frame1: null, frame2: null, frame3: null, frame4: null, frame5: null });
     }
   }, [selectedSkill]);
 
+  // --- DYNAMIC SCHEDULE GENERATOR ---
   const generateDynamicSchedule = () => {
-    if (trainingDrills.length === 0) {
-      setModalMessage("Your 'Drill Bank' is empty. Analyze a skill first to get recommended drills.");
-      setWeeklySchedule([]);
-      return;
+    if (!Array.isArray(trainingDrills) || trainingDrills.length === 0) {
+      setModalMessage("Drill Bank empty. Analyze skills first.");
+      setWeeklySchedule([]); return; // Use setter function
     }
+    const totalMinutes = hoursPerWeek * 60;
+    const sessions = Math.max(1, Math.round(totalMinutes / 90));
+    const minPerSession = Math.floor(totalMinutes / sessions);
+    if (minPerSession < 15) { setModalMessage(`Sessions too short (${minPerSession}m). Increase hours.`); setWeeklySchedule([]); return; } // Use setter
+    if (minPerSession < 30 && sessions > 1) { setModalMessage(`Note: Sessions short (${minPerSession}m).`); }
 
-    const totalMinutesPerWeek = hoursPerWeek * 60;
-    // Aim for sessions of ~90 mins, but be flexible. Min 1 session.
-    const sessionsPerWeek = Math.max(1, Math.round(totalMinutesPerWeek / 90));
-    const minutesPerSession = Math.floor(totalMinutesPerWeek / sessionsPerWeek);
-
-    if (minutesPerSession < 30) {
-      setModalMessage(`At ${hoursPerWeek} hours/week, your ${sessionsPerWeek} sessions are too short. Try increasing your hours or you'll have one longer session.`);
-      // Allow it to proceed, it will just be one session
-    }
-
-    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].slice(0, sessionsPerWeek);
-    let drillIndex = 0; // To loop through the drill bank
-
-    const newSchedule = days.map(day => {
-      const sessionDrills = [];
-      let sessionTime = 0;
-
-      // Keep adding drills until the session is ~full
-      while (sessionTime < minutesPerSession && trainingDrills.length > 0) {
-        // Get the next drill and loop back to the start if we reach the end
-        const drill = trainingDrills[drillIndex % trainingDrills.length];
-        drillIndex++;
-
-        const drillDuration = drill.duration || 15; // Default 15 mins if not specified
-
-        // Only add drill if it fits (or if it's the first drill)
-        if (sessionTime + drillDuration <= minutesPerSession * 1.2 || sessionDrills.length === 0) {
-          sessionDrills.push(drill);
-          sessionTime += drillDuration;
-        } else {
-          // This session is full
-          break;
+    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].slice(0, sessions);
+    const shuffled = [...trainingDrills].sort(() => Math.random() - 0.5);
+    let drillIdx = 0;
+    const newSched = days.map(day => {
+      let sessionDrills = []; let sessionTime = 0; let added = new Set();
+      let attempts = 0; const maxAttempts = shuffled.length * 3;
+      while (sessionTime < minPerSession && attempts < maxAttempts && shuffled.length > 0) {
+        attempts++;
+        const currentIdx = drillIdx % shuffled.length;
+        const drill = shuffled[currentIdx]; drillIdx++;
+        if (!drill || typeof drill.duration !== 'number' || typeof drill.drill !== 'string') continue; // Skip invalid drills
+        const duration = drill.duration || 15;
+        if (!added.has(drill.drill) && (sessionTime + duration <= minPerSession * 1.15 || sessionDrills.length === 0)) { // Allow 15% overrun
+          sessionDrills.push(drill); sessionTime += duration; added.add(drill.drill);
         }
+        if (attempts >= shuffled.length && sessionTime < minPerSession * 0.5) break; // Break early if not filling
       }
+      if (sessionTime < 15 && shuffled.length > 0) console.warn(`${day} session short (${sessionTime}m)`);
+      return { day, drills: sessionDrills, duration: sessionTime };
+    }).filter(s => s.duration > 0); // Remove empty sessions
 
-      return {
-        day: day,
-        drills: sessionDrills,
-        duration: sessionTime
-      };
-    });
+    if (newSched.length < sessions && trainingDrills.length > 0) setModalMessage(`Generated ${newSched.length} sessions. Some may have been too short.`);
+    else if (newSched.length === 0 && trainingDrills.length > 0) setModalMessage(`Could not generate schedule. Drills too long for sessions (${minPerSession}m)?`);
 
-    setWeeklySchedule(newSchedule);
+    setWeeklySchedule(newSched); // Use setter function
   };
 
-
-  /**
-   * --- REAL AI CHATBOT ---
-   */
+  // --- AI COACH CHATBOT FUNCTIONS ---
   const getAIResponse = async (message) => {
-    setIsAiTyping(true);
-    const payload = {
-      contents: [{
-        role: "user",
-        parts: [{ text: message }]
-      }],
-      systemInstruction: {
-        parts: [{ text: AI_COACH_SYSTEM_PROMPT }]
-      }
-    };
-
-    const responseText = await callGeminiAPI(payload);
-    setIsAiTyping(false);
-    return responseText;
+    setIsAiTyping(true); // Set typing indicator ON
+     try {
+        const payload = { contents: [{ role: "user", parts: [{ text: message }] }], systemInstruction: { parts: [{ text: AI_COACH_SYSTEM_PROMPT }] } };
+        const responseText = await callGeminiAPI(payload);
+        return responseText; // Return potentially successful or error string from callGeminiAPI
+     } catch (error) { // Catch unexpected errors during the process
+         console.error("Unexpected error in getAIResponse:", error);
+         return "Sorry, an unexpected error occurred.";
+     } finally {
+        setIsAiTyping(false); // Set typing indicator OFF
+     }
   };
 
   const handleSendMessage = async () => {
     const message = userMessage.trim();
-    if (message === '') return;
+    if (message === '' || isAiTyping) return; // Prevent sending empty or while typing
 
     setChatMessages(prev => [...prev, { type: 'user', text: message }]);
     setUserMessage('');
 
-    const aiResponse = await getAIResponse(message);
-
+    const aiResponse = await getAIResponse(message); // handles typing indicator
     setChatMessages(prev => [...prev, { type: 'ai', text: aiResponse }]);
   };
 
   const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); }
   };
 
-  /**
-   * --- File Selection Logic ---
-   */
+  // --- VIDEO ANALYSIS FUNCTIONS ---
+
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
-    if (file && file.type.startsWith('video/')) {
-      setUploadedVideo(file);
-      setAnalysisComplete(false);
-      // Reset 5 captured frames
-      setKeyframes({ frame1: null, frame2: null, frame3: null, frame4: null, frame5: null });
+     if (!file) return; // Handle no file selected
+    const maxSize = 100 * 1024 * 1024; // 100 MB
+    if (file.size > maxSize) { showModal(`Video too large (max 100MB).`); setUploadedVideo(null); if (fileInputRef.current) fileInputRef.current.value = ""; return; }
+    if (file.type.startsWith('video/')) {
+        setUploadedVideo(file);
+        setAnalysisComplete(false); // Reset analysis state
+        setCurrentAnalysis(null); // Clear previous analysis
+        setKeyframes({ frame1: null, frame2: null, frame3: null, frame4: null, frame5: null }); // Reset frames
     } else {
-      setModalMessage("Please upload a valid video file (e.g., .mp4, .mov).");
-      setUploadedVideo(null);
+        showModal("Please upload a valid video file.");
+        setUploadedVideo(null);
+        if (fileInputRef.current) fileInputRef.current.value = ""; // Clear input if invalid
     }
   };
 
-  /**
-   * --- In-App Screenshot Function ---
-   */
+
   const handleCaptureFrame = (frameSlot) => {
-    if (!videoRef.current || !canvasRef.current) {
-      setModalMessage("Error: Video player not ready.");
-      return;
-    }
+    if (!videoRef.current) { showModal("Video player not ready."); console.error("videoRef missing"); return; }
+    if (!canvasRef.current) { showModal("Canvas element missing."); console.error("canvasRef missing"); return; }
 
     const video = videoRef.current;
     const canvas = canvasRef.current;
 
-    // --- FIX FOR CUT SCREENSHOT ---
-    // Check if video metadata is loaded. If videoWidth is 0, it's not ready.
-    if (!video.videoWidth || video.videoWidth === 0) {
-      setModalMessage("Video is still loading. Please wait a moment after it appears and try again.");
+    // Use readyState > 0 (HAVE_METADATA) as a more reliable check
+    if (video.readyState < 1 || !video.videoWidth || video.videoWidth === 0) {
+      setModalMessage("Video is still loading metadata. Please wait.");
       return;
     }
-    // --- END FIX ---
 
-    // Match canvas size to video's intrinsic size
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-
-    // Draw the current video frame onto the canvas
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+     if (!ctx) { showModal("Could not get canvas context."); console.error("Canvas context failed"); return; }
 
-    // Get the image data from the canvas as a data URL
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.9); // 90% quality JPEG
-
-    // Update the state
-    setKeyframes(prevFrames => ({
-      ...prevFrames,
-      [frameSlot]: dataUrl
-    }));
+    try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.9); // Use JPEG
+        setKeyframes(prevFrames => ({ ...prevFrames, [frameSlot]: dataUrl }));
+    } catch (error) {
+        console.error("Frame capture error:", error);
+        showModal("Error capturing frame.");
+    }
   };
 
-  /**
-   * --- CRITICAL UPDATE: REAL AI ANALYSIS ---
-   * Now sends 4 OR 5 frames and SANITIZES the response
-   */
+  // --- THE CORE AI ANALYSIS FUNCTION ---
   const handleRealAnalysis = async () => {
-    const isShootingOrPassing = selectedSkill === 'shooting' || selectedSkill === 'passing';
+    if (!selectedSkill || !selectedSubSkill) { showModal("Please select skills first."); return; }
 
-    // Dynamic check for captured frames
-    let allFramesCaptured = keyframes.frame1 && keyframes.frame2 && keyframes.frame3 && keyframes.frame4;
-    if (isShootingOrPassing) {
-      allFramesCaptured = allFramesCaptured && keyframes.frame5;
-    }
-
-    if (!allFramesCaptured) {
-      setModalMessage(`Please capture all ${isShootingOrPassing ? 5 : 4} keyframes before analyzing.`);
-      return;
-    }
+    const requiredFramesCount = (keyframeLabelSets[selectedSkill] || []).length; // Use current labels
+    let allCaptured = true;
+    for (let i = 1; i <= requiredFramesCount; i++) { if (!keyframes[`frame${i}`]) allCaptured = false; }
+    if (!allCaptured) { showModal(`Capture all ${requiredFramesCount} frames first.`); return; }
 
     setAnalyzing(true);
+    setCurrentAnalysis(null); // Clear previous analysis immediately
+    setAnalysisComplete(false);
 
     try {
       const skillName = subSkillNames[selectedSubSkill];
-
-      const getBase64 = (dataUrl) => dataUrl.split(',')[1];
-
-      // --- NEW: Dynamically build payload parts ---
-      const payloadParts = [
-        { text: `Analyze this ${isShootingOrPassing ? 5 : 4}-frame sequence for a "${skillName}".` },
-        { inlineData: { mimeType: 'image/jpeg', data: getBase64(keyframes.frame1) } },
-        { inlineData: { mimeType: 'image/jpeg', data: getBase64(keyframes.frame2) } },
-        { inlineData: { mimeType: 'image/jpeg', data: getBase64(keyframes.frame3) } },
-        { inlineData: { mimeType: 'image/jpeg', data: getBase64(keyframes.frame4) } }
-      ];
-
-      // Add 5th frame only if needed
-      if (isShootingOrPassing) {
-        payloadParts.push({ inlineData: { mimeType: 'image/jpeg', data: getBase64(keyframes.frame5) } });
+      const getBase64 = (dataUrl) => dataUrl ? dataUrl.split(',')[1] : null;
+      const payloadParts = [{ text: `Analyze this ${requiredFramesCount}-frame sequence for a "${skillName}".` }];
+      for (let i = 1; i <= requiredFramesCount; i++) {
+          const frameData = getBase64(keyframes[`frame${i}`]);
+          if (!frameData) throw new Error(`Frame ${i} invalid.`);
+          payloadParts.push({ inlineData: { mimeType: 'image/jpeg', data: frameData } }); // Sending JPEG
       }
 
       const payload = {
-        contents: [{ parts: payloadParts }],
-        systemInstruction: {
-          parts: [{ text: AI_ANALYSIS_SYSTEM_PROMPT(selectedSkill, skillName) }]
-        },
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: ANALYSIS_RESPONSE_SCHEMA,
-        }
+          contents: [{ parts: payloadParts }],
+          systemInstruction: { parts: [{ text: AI_ANALYSIS_SYSTEM_PROMPT(selectedSkill, skillName) }] },
+          generationConfig: { responseMimeType: "application/json", responseSchema: ANALYSIS_RESPONSE_SCHEMA }
       };
 
+      console.log("Sending payload to API:", JSON.stringify(payload, null, 2)); // Debug log
+
       const responseText = await callGeminiAPI(payload);
-      const rawAnalysisData = JSON.parse(responseText); // Get the raw, potentially "dirty" data
+       // Check if callGeminiAPI returned an error string
+      if (typeof responseText === 'string' && responseText.startsWith('Error:')) {
+          throw new Error(responseText.substring(7)); // Throw the specific error message
+      }
 
-      // --- *** THIS IS THE FINAL FIX *** ---
-      // Manually clean and sanitize the data *before* saving it to state
-      const analysisData = sanitizeAnalysisData(rawAnalysisData);
-      // --- *** END FIX *** ---
+      console.log("Raw API response text:", responseText); // Debug log
 
-      // Save Progress (uses clean data)
+      let rawData;
+      try { rawData = JSON.parse(responseText); }
+      catch (e) {
+          console.error("Invalid JSON received:", responseText);
+          throw new Error(`AI returned invalid JSON data. Check console.`); // More specific error
+      }
+      console.log("Parsed raw analysis data:", rawData); // Debug log
+
+      const analysisData = sanitizeAnalysisData(rawData);
+      console.log("Sanitized analysis data:", analysisData); // Debug log
+
+       // Add extra validation after sanitization
+      if (typeof analysisData.score !== 'number' || typeof analysisData.proScore !== 'number' || !Array.isArray(analysisData.issues) || !Array.isArray(analysisData.strengths) || !Array.isArray(analysisData.drills) ) {
+           console.error("Sanitized data structure is invalid:", analysisData);
+           throw new Error("Processed analysis data is invalid.");
+      }
+
+
+      // Save Progress
       setProgressData(prevProgress => {
-        const newProgress = JSON.parse(JSON.stringify(prevProgress));
-        if (analysisData.score > newProgress[selectedSkill].subSkills[selectedSubSkill].current) {
-          newProgress[selectedSkill].subSkills[selectedSubSkill].current = analysisData.score;
-        }
-        localStorage.setItem('playSmartProgress', JSON.stringify(newProgress));
-        return newProgress;
+         // Defensive check for structure
+         if (!prevProgress || !prevProgress[selectedSkill]?.subSkills?.[selectedSubSkill]) {
+             console.error("Progress data structure missing for saving:", selectedSkill, selectedSubSkill);
+             return prevProgress; // Return unchanged state
+         }
+          const newProgress = JSON.parse(JSON.stringify(prevProgress));
+          const currentScore = newProgress[selectedSkill].subSkills[selectedSubSkill].current || 0;
+          if (analysisData.score > currentScore) {
+            newProgress[selectedSkill].subSkills[selectedSubSkill].current = analysisData.score;
+            try {
+               localStorage.setItem('playSmartProgress', JSON.stringify(newProgress));
+            } catch (e) { console.error("Error saving progress:", e); showModal("Error saving progress."); }
+          }
+          return newProgress;
       });
 
-      // Save Drills (uses clean data)
-      setTrainingDrills(prevDrills => {
-        const newDrills = analysisData.drills || [];
-        const uniqueNewDrills = newDrills.filter(newDrill =>
-          !prevDrills.some(existingDrill => existingDrill.drill === newDrill.drill)
-        );
-        const updatedDrills = [...prevDrills, ...uniqueNewDrills];
-        localStorage.setItem('playSmartTrainingDrills', JSON.stringify(updatedDrills));
-        return updatedDrills;
-      });
 
-      setCurrentAnalysis(analysisData); // Save the *clean* data
+      // Save Drills
+       setTrainingDrills(prevDrills => {
+           const currentDrillsData = Array.isArray(prevDrills) ? prevDrills : []; // Ensure it's an array
+           const newDrills = analysisData.drills || [];
+           const uniqueNewDrills = newDrills.filter(nd => nd && nd.drill && !currentDrillsData.some(ed => ed && ed.drill === nd.drill));
+           const updatedDrills = [...currentDrillsData, ...uniqueNewDrills];
+           try {
+               localStorage.setItem('playSmartTrainingDrills', JSON.stringify(updatedDrills));
+           } catch (e) { console.error("Error saving drills:", e); showModal("Error saving drills."); }
+           return updatedDrills;
+       });
+
+
+      setCurrentAnalysis(analysisData);
       setAnalysisComplete(true);
       setActiveTab('analysis');
 
     } catch (error) {
       console.error('Analysis failed:', error);
-      setModalMessage(`Analysis Failed: ${error.message}. Make sure the AI returns valid JSON.`);
+      setModalMessage(`Analysis Failed: ${error.message}.`); // Show specific error
+      setAnalysisComplete(false);
+      setCurrentAnalysis(null);
     } finally {
       setAnalyzing(false);
     }
   };
 
-  // Check if all keyframes for the current skill are captured
-  const checkAllFramesCaptured = () => {
-    const isShootingOrPassing = selectedSkill === 'shooting' || selectedSkill === 'passing';
-    let allCaptured = keyframes.frame1 && keyframes.frame2 && keyframes.frame3 && keyframes.frame4;
-    if (isShootingOrPassing) {
-      allCaptured = allCaptured && keyframes.frame5;
+
+  // Helper boolean to check if all frames are ready (Memoized for performance)
+  const allKeyframesCaptured = React.useMemo(() => {
+    if (!selectedSkill) return false;
+    const requiredFramesCount = (keyframeLabelSets[selectedSkill] || []).length;
+    if (requiredFramesCount === 0) return false;
+    for (let i = 1; i <= requiredFramesCount; i++) {
+        if (!keyframes[`frame${i}`]) return false;
     }
-    return allCaptured;
-  };
-  const allKeyframesCaptured = checkAllFramesCaptured();
+    return true;
+  }, [keyframes, selectedSkill]);
 
 
   // Helper function to get the right color for progress bars
   const getBarColor = (skillKey) => {
-    const colorMap = {
-      shooting: 'bg-red-500',
-      passing: 'bg-blue-500',
-      defending: 'bg-green-500',
-      positioning: 'bg-purple-500',
-    };
+    const colorMap = { shooting: 'bg-red-500', passing: 'bg-blue-500', defending: 'bg-green-500', positioning: 'bg-purple-500', };
     return colorMap[skillKey] || 'bg-gray-500';
   };
 
+  // --- RENDER FUNCTION (JSX) ---
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white font-sans"> {/* Added font */}
+      {/* Modal for all notifications */}
       <Modal message={modalMessage} onClose={() => setModalMessage('')} />
       {/* Hidden Canvas for Screenshots */}
       <canvas ref={canvasRef} className="hidden"></canvas>
 
       <div className="max-w-7xl mx-auto p-4 md:p-6">
-        <div className="text-center mb-6">
+        {/* Header */}
+        <header className="text-center mb-6 md:mb-8"> {/* Increased margin */}
           <div className="flex items-center justify-center gap-3 mb-3">
-            <div className="w-12 h-12 bg-gradient-to-br from-green-400 to-blue-500 rounded-xl flex items-center justify-center">
+            <div className="w-12 h-12 bg-gradient-to-br from-green-400 to-blue-500 rounded-xl flex items-center justify-center shadow-lg"> {/* Added shadow */}
               <Zap className="w-7 h-7 text-white" />
             </div>
-            <h1 className="text-4xl font-bold text-white">PlaySmart</h1>
+            <h1 className="text-4xl md:text-5xl font-bold text-white tracking-tight">PlaySmart</h1> {/* Adjusted size/tracking */}
           </div>
-          <p className="text-gray-400">AI-Powered Football Training Platform</p>
-        </div>
+          <p className="text-gray-400 text-sm md:text-base">AI-Powered Football Training Platform</p> {/* Adjusted size */}
+        </header>
 
-        {/* --- UPDATED: TABS (Removed Match AI) --- */}
-        <div className="flex flex-wrap gap-2 mb-6 bg-slate-800/50 p-2 rounded-xl">
+        {/* TABS Navigation */}
+        <nav className="flex flex-wrap gap-2 mb-6 md:mb-8 bg-slate-800/60 p-2 rounded-xl backdrop-blur-sm shadow-md"> {/* Added blur/shadow */}
           {[
-            { id: 'upload', icon: Upload, label: 'Upload' },
-            { id: 'analysis', icon: BarChart3, label: 'Analysis' },
+            { id: 'upload', icon: Upload, label: 'Upload & Analyze' }, // Renamed
+            { id: 'analysis', icon: BarChart3, label: 'Analysis Results' }, // Renamed
             { id: 'progress', icon: TrendingUp, label: 'Progress' },
             { id: 'schedule', icon: Calendar, label: 'Schedule' },
             { id: 'coach', icon: MessageCircle, label: 'AI Coach' }
@@ -699,402 +780,526 @@ const PlaySmart = () => {
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              disabled={tab.id === 'analysis' && !analysisComplete}
-              className={`flex-1 min-w-[90px] py-2 px-2 rounded-lg font-medium transition-all flex items-center justify-center gap-2 text-sm ${
-                activeTab === tab.id ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
-              } ${tab.id === 'analysis' && !analysisComplete ? 'opacity-50 cursor-not-allowed' : ''}`}
+              disabled={(tab.id === 'analysis' && (!analysisComplete || analyzing)) || (tab.id !== 'upload' && analyzing)} // Prevent tab switching during analysis
+              className={`flex-1 min-w-[100px] py-2.5 px-3 rounded-lg font-medium transition-all duration-200 flex items-center justify-center gap-2 text-xs sm:text-sm shadow-sm ${ // Adjusted padding/size
+                activeTab === tab.id
+                 ? 'bg-blue-600 text-white ring-2 ring-blue-400 ring-offset-2 ring-offset-slate-900' // Added ring effect
+                 : 'text-gray-300 hover:text-white hover:bg-slate-700/50' // Improved hover
+              } ${((tab.id === 'analysis' && !analysisComplete) || analyzing) ? 'opacity-50 cursor-not-allowed' : ''}`} // Consistent disabled style
             >
               <tab.icon className="w-4 h-4" />
               {tab.label}
             </button>
           ))}
-        </div>
+        </nav>
 
-        {/* --- "UPLOAD" TAB --- */}
-        {activeTab === 'upload' && (
-          <div className="space-y-4">
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h2 className="text-xl font-bold text-white mb-4">Video Analysis Pipeline</h2>
+        {/* --- Main Content Area --- */}
+        <main>
+            {/* --- TAB CONTENT: "UPLOAD" --- */}
+            {activeTab === 'upload' && (
+              <section className="space-y-6"> {/* Increased spacing */}
+                {/* Main Card */}
+                <div className="bg-slate-800/60 rounded-xl p-5 md:p-8 border border-slate-700 shadow-xl backdrop-blur-sm"> {/* Increased padding/shadow */}
+                  <h2 className="text-xl md:text-2xl font-bold text-white mb-6">Video Analysis Pipeline</h2> {/* Increased size/margin */}
 
-              {/* --- Step 1: Select Category --- */}
-              <div>
-                <h3 className="text-lg font-semibold text-white mb-3">Step 1: Select a Category</h3>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                  {Object.entries(skills).map(([key, skill]) => (
-                    <button
-                      key={key}
-                      onClick={() => setSelectedSkill(key)}
-                      className={`p-3 rounded-lg border-2 transition-all ${
-                        selectedSkill === key ? 'border-blue-500 bg-blue-500/20' : 'border-slate-700 bg-slate-800/50'
-                      }`}
-                    >
-                      <skill.icon className={`w-6 h-6 mx-auto mb-1 ${selectedSkill === key ? 'text-blue-400' : 'text-gray-400'}`} />
-                      <p className={`text-sm ${selectedSkill === key ? 'text-white' : 'text-gray-400'}`}>{skill.name}</p>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* --- Step 2: Select Sub-Skill (Show after category) --- */}
-              {selectedSkill && (
-                <div className="border-t border-slate-700 pt-4 mt-4">
-                  <h3 className="text-lg font-semibold text-white mb-3">Step 2: Select a Skill</h3>
-                  <div className="grid grid-cols-3 gap-2">
-                    {skills[selectedSkill].subSkills.map(sub => (
-                      <button
-                        key={sub}
-                        onClick={() => setSelectedSubSkill(sub)}
-                        className={`p-2 rounded-lg text-xs transition-all ${
-                          selectedSubSkill === sub ? 'bg-blue-600 text-white' : 'bg-slate-700 text-gray-300'
-                        }`}
-                      >
-                        {subSkillNames[sub]}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* --- Step 3: Upload Video (Show after sub-skill) --- */}
-              {selectedSkill && selectedSubSkill && !uploadedVideo && (
-                <div className="border-t border-slate-700 pt-4 mt-4">
-                  <h3 className="text-lg font-semibold text-white mb-3">Step 3: Upload Your Video</h3>
-                  <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="video/*" className="hidden" />
-                  <div onClick={() => fileInputRef.current?.click()} className="border-2 border-dashed border-slate-600 rounded-xl p-8 text-center cursor-pointer hover:border-blue-500 transition-all">
-                    <Video className="w-12 h-12 text-gray-500 mx-auto mb-3" />
-                    <p className="text-lg text-gray-300">Click to upload your video (MP4, MOV)</p>
-                  </div>
-                </div>
-              )}
-
-              {/* --- Step 4: Capture Keyframes (Show after video) --- */}
-              {selectedSkill && selectedSubSkill && uploadedVideo && (
-                <div className="border-t border-slate-700 pt-4 mt-4 space-y-4">
-                  <div>
-                    <h3 className="text-lg font-semibold text-white mb-2">Step 4: Capture {keyframeLabels.length} Keyframes for <span className="text-blue-400">{subSkillNames[selectedSubSkill]}</span></h3>
-                    <video
-                      ref={videoRef}
-                      src={URL.createObjectURL(uploadedVideo)}
-                      controls
-                      className="w-full rounded-lg max-h-64 object-contain bg-black"
-                      onLoadedMetadata={(e) => {
-                        console.log("Video metadata loaded");
-                      }}
-                    />
-                  </div>
-
-                  <div>
-                    <p className="text-sm text-gray-400 mb-3">Play/pause your video and capture the {keyframeLabels.length} key moments.</p>
-
-                    {/* DYNAMIC KEYFRAME UI */}
-                    <div className={`grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3`}>
-                      {keyframeLabels.map((label, index) => {
-                        const frameKey = `frame${index + 1}`;
-                        // This check handles the 4-frame vs 5-frame logic
-                        if (index < keyframeLabels.length) {
-                          return (
-                            <div className="text-center" key={frameKey}>
-                              <div className="w-full aspect-video bg-slate-700 rounded-lg mb-2 flex items-center justify-center overflow-hidden">
-                                {keyframes[frameKey] ? (
-                                  <img src={keyframes[frameKey]} alt={label} className="w-full h-full object-cover" />
-                                ) : (
-                                  <ImageIcon className="w-8 h-8 text-gray-500" />
-                                )}
-                              </div>
-                              <button
-                                onClick={() => handleCaptureFrame(frameKey)}
-                                className="w-full text-xs bg-slate-700 hover:bg-slate-600 text-white py-2 px-2 rounded-lg"
-                              >
-                                {label}
-                              </button>
-                            </div>
-                          );
-                        }
-                        return null; // Don't render frame 5 for defending/positioning
-                      })}
-                    </div>
-                  </div>
-
-                  {/* --- Step 5: Analyze --- */}
-                  <div>
-                    {analyzing ? (
-                      <div className="bg-blue-600 text-white py-3 px-4 rounded-xl text-center flex items-center justify-center gap-2">
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Analyzing {subSkillNames[selectedSubSkill]}...
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleRealAnalysis}
-                        disabled={!allKeyframesCaptured}
-                        className={`w-full text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all ${
-                          !allKeyframesCaptured
-                            ? 'bg-gray-600 cursor-not-allowed'
-                            : 'bg-blue-600 hover:bg-blue-700'
-                        }`}
-                      >
-                        <Play className="w-5 h-5" />
-                        {!allKeyframesCaptured ? `Capture all ${keyframeLabels.length} frames` : `Analyze ${subSkillNames[selectedSubSkill]}`}
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* --- "ANALYSIS" TAB --- */}
-        {activeTab === 'analysis' && analysisComplete && currentAnalysis && (
-          <div className="space-y-4">
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <div className="flex justify-between mb-4">
-                <div>
-                  <h2 className="text-2xl font-bold text-white">{subSkillNames[selectedSubSkill]}</h2>
-                  <p className="text-gray-400 text-sm">vs Professional level</p>
-                </div>
-                <div className="text-right">
-                  <div className="text-4xl font-bold text-blue-400">{currentAnalysis.score}</div>
-                  <div className="text-xs text-green-400">Pro: {currentAnalysis.proScore}</div>
-                </div>
-              </div>
-              <div className="w-full bg-slate-700 rounded-full h-3 relative">
-                <div className="bg-blue-600 h-3 rounded-full" style={{ width: `${(currentAnalysis.score / currentAnalysis.proScore) * 100}%` }}></div>
-              </div>
-              <div className="text-center text-sm mt-2 text-orange-400">Gap: {currentAnalysis.proScore - currentAnalysis.score} points</div>
-            </div>
-
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h3 className="text-lg font-bold text-white mb-3">Issues Detected</h3>
-              <div className="space-y-2">
-                {currentAnalysis.issues.length === 0 ? (
-                  <div className="p-3 rounded-lg bg-green-500/10 border-l-4 border-green-500">
-                    <p className="text-white text-sm">AI detected no major issues. Great job!</p>
-                  </div>
-                ) : (
-                  currentAnalysis.issues.map((item, idx) => (
-                    <div key={idx} className={`p-3 rounded-lg border-l-4 ${item.severity === 'high' ? 'bg-red-500/10 border-red-500' : (item.severity === 'medium' ? 'bg-orange-500/10 border-orange-500' : 'bg-yellow-500/10 border-yellow-500')}`}>
-                      <p className="text-white text-sm mb-1">{item.issue}</p>
-                      <p className="text-green-400 text-xs">✓ {item.fix}</p>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h3 className="text-lg font-bold text-white mb-3">Strengths</h3>
-              <div className="flex flex-wrap gap-2">
-                {currentAnalysis.strengths.length === 0 ? (
-                  <p className="text-gray-400 text-sm">No significant strengths detected. Keep practicing!</p>
-                ) : (
-                  currentAnalysis.strengths.map((s, i) => (
-                    <span key={i} className="bg-green-500/10 border border-green-500/30 rounded-lg px-3 py-1 text-green-400 text-sm">{s}</span>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div className="bg-blue-600/20 rounded-xl p-6 border border-blue-500/30">
-              <h3 className="text-lg font-bold text-white mb-3">Training Plan (Added to your Drill Bank)</h3>
-              {currentAnalysis.drills.length === 0 ? (
-                 <p className="text-gray-400 text-sm">No specific drills added. Focus on the corrections.</p>
-              ) : (
-                currentAnalysis.drills.map((drill, idx) => (
-                  <div key={idx} className="bg-slate-800/50 rounded-lg p-3 mb-2 flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center text-white text-sm">{idx + 1}</div>
-                      <p className="text-gray-300 text-sm">{drill.drill}</p>
-                    </div>
-                    <span className="text-blue-400 text-sm">{drill.duration} min</span>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'progress' && (
-          <div className="space-y-4">
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h2 className="text-xl font-bold text-white mb-6">Your Skill Progress</h2>
-
-              {Object.keys(skills).map((skillKey) => {
-                const skill = skills[skillKey];
-                const skillProgress = progressData[skillKey];
-
-                return (
-                  <div key={skillKey} className="mb-6">
-                    <div className="flex items-center gap-3 mb-3">
-                      <skill.icon className={`w-6 h-6 text-${skill.color}-400`} />
-                      <h3 className={`text-lg font-semibold text-white`}>{skill.name}</h3>
-                    </div>
-
-                    <div className="space-y-3">
-                      {skill.subSkills.map((subSkillKey) => {
-                        const subSkillData = skillProgress.subSkills[subSkillKey];
-                        const subSkillName = subSkillNames[subSkillKey];
-                        const score = subSkillData.current;
-                        const target = subSkillData.target;
-                        const percentage = (score / target) * 100;
-
-                        return (
-                          <div key={subSkillKey} className="pl-4 border-l-2 border-slate-700">
-                            <div className="flex justify-between mb-1">
-                              <span className="text-sm text-gray-300">{subSkillName}</span>
-                              <span className={`text-sm ${score > 0 ? 'text-white' : 'text-gray-500'}`}>
-                                {score} / {target}
-                              </span>
-                            </div>
-                            <div className="bg-slate-700 rounded-full h-2.5">
-                              <div
-                                className={`${getBarColor(skillKey)} h-2.5 rounded-full transition-all duration-500`}
-                                style={{ width: `${percentage}%` }}
-                              ></div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'schedule' && (
-          <div className="space-y-4">
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h2 className="text-xl font-bold text-white mb-4">Training Schedule Generator</h2>
-              <div className="mb-4">
-                <label className="text-gray-300 mb-2 block">Hours per week: {hoursPerWeek}h</label>
-                <input
-                  type="range"
-                  min="2"
-                  max="15"
-                  value={hoursPerWeek}
-                  onChange={(e) => setHoursPerWeek(parseInt(e.target.value))}
-                  className="w-full"
-                />
-              </div>
-              <button
-                onClick={generateDynamicSchedule}
-                className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 hover:bg-blue-700 transition-all"
-              >
-                Generate My Weekly Schedule
-              </button>
-            </div>
-
-            {weeklySchedule.length > 0 && (
-              <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-                <h3 className="text-lg font-bold text-white mb-4">Your Generated Plan</h3>
-                <div className="space-y-3">
-                  {weeklySchedule.map((session, idx) => (
-                    <div key={idx} className="bg-slate-900/50 rounded-lg p-4 border border-slate-700">
-                      <div className="flex justify-between mb-2">
-                        <div className="text-white font-semibold">{session.day}</div>
-                        <div className="text-blue-400">{session.duration} min</div>
-                      </div>
-                      <ul className="list-disc list-inside space-y-1">
-                        {session.drills.map((drill, i) => (
-                          <li key={i} className="text-gray-300 text-sm">
-                            {drill.drill} <span className="text-gray-500">({drill.duration} min)</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700">
-              <h3 className="text-lg font-bold text-white mb-4">Your AI Drill Bank</h3>
-              <div className="space-y-2 max-h-60 overflow-y-auto">
-                {trainingDrills.length === 0 ? (
-                  <p className="text-gray-500 text-sm text-center">Your Drill Bank is empty. Analyze a skill to add drills.</p>
-                ) : (
-                  trainingDrills.map((drill, idx) => (
-                    <div key={idx} className="bg-slate-700 rounded-lg p-3 flex justify-between items-center">
-                      <p className="text-gray-300 text-sm">{drill.drill}</p>
-                      <span className="text-blue-400 text-sm">{drill.duration} min</span>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* --- "Match AI" Tab is GONE --- */}
-
-        {activeTab === 'coach' && (
-          <div className="space-y-4">
-            <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700 h-[600px] flex flex-col">
-              <div className="flex items-center gap-3 mb-4 pb-4 border-b border-slate-700">
-                <div className="w-12 h-12 bg-gradient-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center">
-                  <MessageCircle className="w-6 h-6 text-white" />
-                </div>
-                <div>
-                  <h2 className="text-xl font-bold text-white">AI Football Coach</h2>
-                  <p className="text-gray-400 text-sm">Ask anything about techniques & training</p>
-                </div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto mb-4 space-y-3">
-                {chatMessages.length === 0 ? (
-                  <div className="text-center py-12">
-                    <MessageCircle className="w-16 h-16 text-gray-600 mx-auto mb-4" />
-                    <p className="text-gray-400 mb-4">Ask me about:</p>
-                    <div className="grid grid-cols-2 gap-2 max-w-md mx-auto">
-                      {['Power shots', 'Finesse technique', 'Defending', 'Passing', 'Weak foot', 'Fitness'].map((topic, i) => (
+                  {/* Step 1: Select Category */}
+                  <div className="mb-6">
+                    <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">1</span> Select Category</h3> {/* Styled step number */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3"> {/* Increased gap */}
+                      {Object.entries(skills).map(([key, skill]) => (
                         <button
-                          key={i}
-                          onClick={() => setUserMessage(`How to improve ${topic.toLowerCase()}?`)}
-                          className="bg-slate-700 hover:bg-slate-600 text-gray-300 text-sm py-2 px-3 rounded-lg"
+                          key={key}
+                          onClick={() => setSelectedSkill(key)}
+                          // Visual feedback on selection
+                          className={`p-4 rounded-lg border-2 transition-all duration-200 transform hover:scale-105 ${
+                            selectedSkill === key
+                             ? 'border-blue-500 bg-blue-500/20 shadow-md'
+                             : 'border-slate-600 bg-slate-700/40 hover:border-slate-500'
+                          }`}
                         >
-                          {topic}
+                          <skill.icon className={`w-7 h-7 mx-auto mb-2 ${selectedSkill === key ? 'text-blue-400' : 'text-gray-400'}`} /> {/* Increased size/margin */}
+                          <p className={`text-sm font-medium ${selectedSkill === key ? 'text-white' : 'text-gray-300'}`}>{skill.name}</p>
                         </button>
                       ))}
                     </div>
                   </div>
-                ) : (
-                  <>
-                    {chatMessages.map((msg, idx) => (
-                      <div key={idx} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[80%] p-3 rounded-lg ${msg.type === 'user' ? 'bg-blue-600 text-white' : 'bg-slate-700 text-gray-200'}`}>
-                          <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
-                        </div>
-                      </div>
-                    ))}
-                    {isAiTyping && (
-                      <div className="flex justify-start">
-                        <div className="bg-slate-700 text-gray-200 p-3 rounded-lg">
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                        </div>
-                      </div>
-                    )}
-                    <div ref={chatEndRef} />
-                  </>
-                )}
-              </div>
 
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={userMessage}
-                  onChange={(e) => setUserMessage(e.target.value)}
-                  onKeyPress={handleKeyPress}
-                  placeholder="Ask me anything..."
-                  className="flex-1 bg-slate-700 text-white px-4 py-3 rounded-lg focus:outline-none"
-                />
-                <button onClick={handleSendMessage} className="bg-blue-600 text-white px-6 py-3 rounded-lg">
-                  <Send className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+                  {/* Step 2: Select Sub-Skill (Conditional Render) */}
+                  {selectedSkill && (
+                    <div className="border-t border-slate-700 pt-6 mt-6">
+                      <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">2</span> Select Skill to Analyze</h3>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2"> {/* Responsive grid */}
+                        {(skills[selectedSkill]?.subSkills || []).map(sub => ( // Added fallback for safety
+                          <button
+                            key={sub}
+                            onClick={() => setSelectedSubSkill(sub)}
+                            className={`p-2.5 rounded-md text-xs sm:text-sm transition-colors duration-150 ${ // Adjusted padding/size
+                              selectedSubSkill === sub
+                               ? 'bg-blue-600 text-white font-semibold shadow'
+                               : 'bg-slate-600/50 text-gray-300 hover:bg-slate-500/50'
+                            }`}
+                          >
+                            {subSkillNames[sub] || sub}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Step 3: Upload Video (Conditional Render) */}
+                  {selectedSkill && selectedSubSkill && !uploadedVideo && (
+                    <div className="border-t border-slate-700 pt-6 mt-6">
+                      <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2"><span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">3</span> Upload Your Video</h3>
+                      <input type="file" ref={fileInputRef} onChange={handleFileSelect} accept="video/*" className="hidden" />
+                      <div onClick={() => fileInputRef.current?.click()} className="border-2 border-dashed border-slate-600 rounded-xl p-8 text-center cursor-pointer hover:border-blue-500 transition-colors duration-200 bg-slate-700/20">
+                        <Video className="w-12 h-12 text-gray-500 mx-auto mb-3" />
+                        <p className="text-base md:text-lg text-gray-300">Click to upload video (MP4, MOV)</p> {/* Adjusted size */}
+                        <p className="text-xs text-gray-500 mt-1">(Max 100MB)</p>
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Step 4 & 5: Capture & Analyze (Conditional Render) */}
+                  {selectedSkill && selectedSubSkill && uploadedVideo && (
+                    <div className="border-t border-slate-700 pt-6 mt-6 space-y-6">
+                      {/* Video Player */}
+                      <div>
+                        <h3 className="text-lg font-semibold text-white mb-3 flex items-center gap-2">
+                            <span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">4</span> Capture Keyframes: <span className="text-blue-400 font-medium">{subSkillNames[selectedSubSkill] || selectedSubSkill}</span>
+                        </h3>
+                        <div className="relative rounded-lg overflow-hidden shadow-lg border border-slate-700"> {/* Added styling */}
+                             <video
+                              ref={videoRef}
+                              src={URL.createObjectURL(uploadedVideo)}
+                              controls
+                              className="w-full max-h-72 object-contain bg-black" // Increased max-height
+                              onLoadedMetadata={(e) => {
+                                console.log("Video metadata loaded");
+                                // Ensure canvas size matches video on load
+                                if (canvasRef.current && videoRef.current) {
+                                    canvasRef.current.width = videoRef.current.videoWidth;
+                                    canvasRef.current.height = videoRef.current.videoHeight;
+                                }
+                              }}
+                              onError={(e) => {
+                                  console.error("Video loading error:", e);
+                                  setModalMessage("Error loading video. Please try a different file.");
+                                  setUploadedVideo(null); // Reset video state
+                              }}
+                            />
+                        </div>
+
+                      </div>
+
+                      {/* Keyframe Capture Area */}
+                      <div>
+                        <p className="text-sm text-gray-400 mb-4">Play/pause your video at the right moments and click the buttons below to capture the {keyframeLabels.length} keyframes.</p>
+
+                        <div className={`grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4`} key={selectedSkill}> {/* Increased gap */}
+                          {(keyframeLabels || []).map((label, index) => { // Added fallback
+                            const frameKey = `frame${index + 1}`;
+                            return (
+                                <div className="text-center" key={frameKey}>
+                                  {/* Preview Box */}
+                                  <div className={`w-full aspect-video bg-slate-700 rounded-lg mb-2 flex items-center justify-center overflow-hidden border-2 ${keyframes[frameKey] ? 'border-green-500' : 'border-slate-600'}`}> {/* Border indication */}
+                                    {keyframes[frameKey] ? (
+                                      <img src={keyframes[frameKey]} alt={label} className="w-full h-full object-cover" />
+                                    ) : (
+                                      <ImageIcon className="w-6 h-6 sm:w-8 sm:h-8 text-gray-500" />
+                                    )}
+                                  </div>
+                                  {/* Capture Button */}
+                                  <button
+                                    onClick={() => handleCaptureFrame(frameKey)}
+                                    className="w-full text-xs bg-slate-600 hover:bg-slate-500 text-white py-2 px-2 rounded-lg transition-colors duration-150 shadow-sm"
+                                  >
+                                    {label}
+                                  </button>
+                                </div>
+                              );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Step 5: Analyze Button */}
+                      <div className="pt-4">
+                       <h3 className="text-lg font-semibold text-white mb-3 flex items-center gap-2"><span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">5</span> Analyze</h3>
+                        {analyzing ? (
+                          <div className="bg-blue-600/80 text-white py-3 px-4 rounded-xl text-center flex items-center justify-center gap-2 shadow"> {/* Adjusted style */}
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                            Analyzing {subSkillNames[selectedSubSkill] || selectedSubSkill}... Please wait.
+                          </div>
+                        ) : (
+                          <button
+                            onClick={handleRealAnalysis}
+                            disabled={!allKeyframesCaptured}
+                            className={`w-full text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all duration-200 transform hover:scale-105 shadow-lg ${ // Added effects
+                              !allKeyframesCaptured
+                                ? 'bg-gray-600 cursor-not-allowed opacity-70' // Clearer disabled state
+                                : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700' // Gradient
+                            }`}
+                          >
+                            <Play className="w-5 h-5" />
+                            {!allKeyframesCaptured ? `Capture all ${keyframeLabels.length} frames` : `Analyze ${subSkillNames[selectedSubSkill] || selectedSubSkill}`}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {/* --- TAB CONTENT: "ANALYSIS" --- */}
+            {activeTab === 'analysis' && ( // Simplified conditional rendering
+                <section className="space-y-6">
+                    {/* Show only if analysis is complete and data exists */}
+                    {analysisComplete && currentAnalysis ? (
+                        <>
+                            {/* Score Card */}
+                            <div className="bg-slate-800/60 rounded-xl p-6 border border-slate-700 shadow-xl backdrop-blur-sm">
+                              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4">
+                                <div>
+                                  <h2 className="text-2xl md:text-3xl font-bold text-white">{subSkillNames[selectedSubSkill] || selectedSubSkill}</h2>
+                                  <p className="text-gray-400 text-sm">Analysis vs Professional Benchmark</p>
+                                </div>
+                                <div className="text-left sm:text-right mt-2 sm:mt-0">
+                                  <div className="text-4xl font-bold text-blue-400">{currentAnalysis.score} <span className="text-2xl text-gray-400">/ 100</span></div>
+                                  <div className="text-xs text-green-400 mt-1">Pro Benchmark: {currentAnalysis.proScore}</div>
+                                </div>
+                              </div>
+                              {/* Progress Bar */}
+                              <div className="w-full bg-slate-700 rounded-full h-3 relative overflow-hidden">
+                                 {/* Background benchmark line */}
+                                 <div className="absolute top-0 left-0 h-full bg-green-500/30 rounded-full" style={{ width: `${currentAnalysis.proScore > 0 ? (currentAnalysis.proScore / 100) * 100 : 0}%` }}></div>
+                                 {/* Actual score bar */}
+                                <div className="absolute top-0 left-0 bg-gradient-to-r from-blue-500 to-indigo-500 h-3 rounded-full transition-all duration-500 ease-out" style={{ width: `${currentAnalysis.score > 0 ? (currentAnalysis.score / 100) * 100 : 0}%` }}></div> {/* Use 100 as max */}
+                              </div>
+                              {/* Gap Text */}
+                               {typeof currentAnalysis.score === 'number' && typeof currentAnalysis.proScore === 'number' && currentAnalysis.score < currentAnalysis.proScore && (
+                                   <div className="text-center text-sm mt-3 text-orange-400">Improvement Gap: {Math.max(0, currentAnalysis.proScore - currentAnalysis.score)} points to Pro</div>
+                               )}
+                                {typeof currentAnalysis.score === 'number' && typeof currentAnalysis.proScore === 'number' && currentAnalysis.score >= currentAnalysis.proScore && (
+                                   <div className="text-center text-sm mt-3 text-green-400">Excellent! You've met or exceeded the Pro benchmark.</div>
+                               )}
+                            </div>
+
+                            {/* Issues Detected Card */}
+                            <div className="bg-slate-800/60 rounded-xl p-6 border border-slate-700 shadow-xl backdrop-blur-sm">
+                              <h3 className="text-xl font-bold text-white mb-4">Areas for Improvement</h3>
+                              <div className="space-y-3">
+                                {currentAnalysis.issues.length === 0 ? (
+                                  <div className="p-4 rounded-lg bg-green-500/10 border border-green-500/30">
+                                    <p className="text-white text-sm font-medium">No major issues detected by the AI. Great technique!</p>
+                                  </div>
+                                ) : (
+                                  currentAnalysis.issues.map((item, idx) => (
+                                    <div key={`issue-${idx}`} className={`p-4 rounded-lg border-l-4 ${item.severity === 'high' ? 'bg-red-500/10 border-red-500' : (item.severity === 'medium' ? 'bg-orange-500/10 border-orange-500' : 'bg-yellow-500/10 border-yellow-500')}`}>
+                                      <p className="text-white text-sm font-semibold mb-1">{item.issue || 'N/A'}</p>
+                                      <p className="text-green-400 text-xs flex items-center gap-1"> <CheckCircle className="w-3 h-3 inline-block"/> Fix: {item.fix || 'N/A'}</p>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Strengths Card */}
+                            <div className="bg-slate-800/60 rounded-xl p-6 border border-slate-700 shadow-xl backdrop-blur-sm">
+                              <h3 className="text-xl font-bold text-white mb-4">Key Strengths</h3>
+                              <div className="flex flex-wrap gap-3">
+                                {currentAnalysis.strengths.length === 0 ? (
+                                  <p className="text-gray-400 text-sm italic">Focus on addressing the areas for improvement.</p>
+                                ) : (
+                                  currentAnalysis.strengths.map((s, i) => (
+                                    <span key={`strength-${i}`} className="bg-green-500/15 border border-green-500/40 rounded-full px-4 py-1.5 text-green-300 text-sm font-medium shadow-sm">{s}</span> // Pill style
+                                  ))
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Training Plan Card */}
+                            <div className="bg-gradient-to-br from-blue-700/20 to-indigo-700/20 rounded-xl p-6 border border-blue-500/40 shadow-xl backdrop-blur-sm">
+                              <h3 className="text-xl font-bold text-white mb-4">Recommended Drills (Added to Drill Bank)</h3>
+                              {currentAnalysis.drills.length === 0 ? (
+                                 <p className="text-gray-300 text-sm italic">No specific drills recommended for now. Focus on the suggested corrections.</p>
+                              ) : (
+                                <ul className="space-y-3"> {/* Use list for semantics */}
+                                  {currentAnalysis.drills.map((drill, idx) => (
+                                    <li key={`drill-${idx}`} className="bg-slate-800/70 rounded-lg p-3 flex items-center justify-between shadow">
+                                      <div className="flex items-center gap-3">
+                                        <div className="w-7 h-7 bg-gradient-to-br from-blue-500 to-indigo-500 rounded-full flex items-center justify-center text-white text-xs font-bold">{idx + 1}</div>
+                                        <p className="text-gray-200 text-sm">{drill.drill || 'N/A'}</p>
+                                      </div>
+                                      <span className="text-blue-300 text-sm font-medium bg-slate-700 px-2 py-0.5 rounded">{drill.duration || '?'} min</span>
+                                    </li>
+                                  ))}
+                                  </ul>
+                              )}
+                            </div>
+                        </>
+                    ) : (
+                         // Message when analysis hasn't been run or data is missing
+                        <div className="text-center py-12 px-6 bg-slate-800/60 rounded-xl border border-slate-700 shadow-xl backdrop-blur-sm">
+                            <BarChart3 className="w-16 h-16 text-gray-600 mx-auto mb-4" />
+                            <h3 className="text-xl font-semibold text-white mb-2">Analysis Results Appear Here</h3>
+                            <p className="text-gray-400">
+                                {analyzing
+                                 ? "Analysis is currently in progress..."
+                                 : "Go to the 'Upload & Analyze' tab, select a skill, upload a video, capture the keyframes, and click 'Analyze' to see your results."}
+                             </p>
+                        </div>
+                    )}
+                </section>
+            )}
+
+
+            {/* --- TAB CONTENT: "PROGRESS" --- */}
+            {activeTab === 'progress' && (
+              <section className="space-y-6">
+                <div className="bg-slate-800/60 rounded-xl p-6 md:p-8 border border-slate-700 shadow-xl backdrop-blur-sm">
+                  <h2 className="text-xl md:text-2xl font-bold text-white mb-6">Your Skill Progress Tracker</h2>
+
+                  {Object.keys(skills).map((skillKey) => {
+                    const skill = skills[skillKey];
+                    // Check if progressData for this skill exists
+                    const skillProgress = progressData[skillKey];
+                     if (!skillProgress || !skillProgress.subSkills) return null; // Skip rendering if data is missing
+
+
+                    return (
+                      <div key={skillKey} className="mb-8 last:mb-0"> {/* Add margin bottom */}
+                        {/* Category Header */}
+                        <div className="flex items-center gap-3 mb-4 pb-2 border-b border-slate-600">
+                          <skill.icon className={`w-6 h-6 text-${skill.color}-400`} />
+                          <h3 className={`text-lg font-semibold text-white`}>{skill.name}</h3>
+                        </div>
+
+                        {/* Sub-skill bars */}
+                        <div className="space-y-4">
+                          {skill.subSkills.map((subSkillKey) => {
+                             // Check if subSkillData exists
+                            const subSkillData = skillProgress.subSkills[subSkillKey];
+                            if (!subSkillData) return null; // Skip if missing
+
+                            const subSkillName = subSkillNames[subSkillKey] || subSkillKey;
+                            const score = subSkillData.current || 0; // Default to 0
+                            const target = subSkillData.target || 100; // Default to 100
+                             // Prevent division by zero
+                            const percentage = target > 0 ? (score / target) * 100 : 0;
+
+                            return (
+                              <div key={subSkillKey} className="pl-2"> {/* Reduced padding */}
+                                <div className="flex justify-between items-center mb-1">
+                                  <span className="text-sm text-gray-300">{subSkillName}</span>
+                                  <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${score > 0 ? 'bg-slate-600 text-white' : 'bg-slate-700 text-gray-400'}`}>
+                                    {score} / {target}
+                                  </span>
+                                </div>
+                                {/* Progress bar with transition */}
+                                <div className="bg-slate-700 rounded-full h-2.5 overflow-hidden">
+                                  <div
+                                    className={`${getBarColor(skillKey)} h-2.5 rounded-full transition-all duration-700 ease-out`} // Longer transition
+                                    // Ensure percentage is within bounds
+                                    style={{ width: `${Math.max(0, Math.min(100, percentage))}%` }}
+                                  ></div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                           {/* Add message if no subskills have progress */}
+                           {skill.subSkills.every(sub => !skillProgress.subSkills[sub] || skillProgress.subSkills[sub].current === 0) && (
+                               <p className="text-sm text-gray-500 italic pl-2">No progress recorded for {skill.name} skills yet.</p>
+                           )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                   {/* Add message if no progress overall */}
+                   {Object.keys(progressData).length === 0 || Object.values(progressData).every(cat => Object.values(cat.subSkills).every(sub => sub.current === 0)) && (
+                       <div className="text-center py-8 text-gray-500">
+                           <TrendingUp className="w-12 h-12 mx-auto mb-3" />
+                           <p>Your progress will appear here after you analyze some skills.</p>
+                       </div>
+                   )}
+                </div>
+              </section>
+            )}
+
+            {/* --- TAB CONTENT: "SCHEDULE" --- */}
+            {activeTab === 'schedule' && (
+              <section className="space-y-6">
+                {/* Controls Card */}
+                <div className="bg-slate-800/60 rounded-xl p-6 md:p-8 border border-slate-700 shadow-xl backdrop-blur-sm">
+                  <h2 className="text-xl md:text-2xl font-bold text-white mb-6">Training Schedule Generator</h2>
+                  <div className="mb-6">
+                    <label htmlFor="hoursRange" className="text-gray-300 mb-2 block font-medium">Available Training Hours Per Week: <span className="text-blue-400 font-bold">{hoursPerWeek}h</span></label>
+                    <input
+                      id="hoursRange" // Corrected ID
+                      type="range"
+                      min="1" // Start from 1 hour
+                      max="20" // Increased max
+                      step="1" // Increment by 1
+                      value={hoursPerWeek}
+                      onChange={(e) => setHoursPerWeek(parseInt(e.target.value))}
+                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-blue-500" // Styled range input
+                    />
+                  </div>
+                  <button
+                    onClick={generateDynamicSchedule}
+                    disabled={trainingDrills.length === 0} // Disable if no drills
+                    className={`w-full text-white py-3 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all duration-200 transform hover:scale-105 shadow-lg ${
+                        trainingDrills.length === 0
+                        ? 'bg-gray-600 cursor-not-allowed opacity-70'
+                        : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700'
+                    }`}
+                  >
+                     <Calendar className="w-5 h-5"/>
+                    {trainingDrills.length === 0 ? 'Analyze Skills to Generate' : 'Generate My Weekly Schedule'}
+                  </button>
+                </div>
+
+                {/* Generated Plan Card (Conditional Render) */}
+                {weeklySchedule.length > 0 && (
+                  <div className="bg-slate-800/60 rounded-xl p-6 md:p-8 border border-slate-700 shadow-xl backdrop-blur-sm">
+                    <h3 className="text-xl font-bold text-white mb-5">Your Generated Weekly Plan</h3>
+                    <div className="space-y-4">
+                      {weeklySchedule.map((session, idx) => (
+                        <div key={`session-${idx}`} className="bg-slate-900/50 rounded-lg p-4 border border-slate-700 shadow-sm">
+                          <div className="flex justify-between items-center mb-3 pb-2 border-b border-slate-600">
+                            <div className="text-white font-semibold text-lg">{session.day}</div>
+                            <div className="text-blue-300 bg-slate-700 px-2.5 py-1 rounded-full text-xs font-medium">{session.duration} min Session</div>
+                          </div>
+                          {session.drills.length > 0 ? (
+                              <ul className="space-y-2">
+                                {session.drills.map((drill, i) => (
+                                  <li key={`session-${idx}-drill-${i}`} className="text-gray-300 text-sm flex items-center gap-2">
+                                     <CheckCircle className="w-4 h-4 text-green-400 flex-shrink-0"/>
+                                     <span>{drill.drill || 'N/A'} <span className="text-gray-500">({drill.duration || '?'} min)</span></span>
+                                  </li>
+                                ))}
+                              </ul>
+                          ) : (
+                              <p className="text-sm text-gray-500 italic">Rest day or session too short for assigned drills.</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Drill Bank Card */}
+                <div className="bg-slate-800/60 rounded-xl p-6 md:p-8 border border-slate-700 shadow-xl backdrop-blur-sm">
+                  <h3 className="text-xl font-bold text-white mb-4">Your AI Drill Bank</h3>
+                  <div className="space-y-2 max-h-60 overflow-y-auto pr-2 border border-slate-700 rounded-lg p-3 bg-slate-900/30 custom-scrollbar"> {/* Added styles */}
+                    {trainingDrills.length === 0 ? (
+                      <p className="text-gray-500 text-sm text-center py-4">Your Drill Bank is empty. Analyze a skill to add drills recommended by the AI.</p>
+                    ) : (
+                      trainingDrills.map((drill, idx) => (
+                         // Added validation
+                        drill && drill.drill && drill.duration ? (
+                            <div key={`bank-drill-${idx}`} className="bg-slate-700/50 hover:bg-slate-600/50 rounded-lg p-3 flex justify-between items-center transition-colors duration-150">
+                              <p className="text-gray-200 text-sm mr-2">{drill.drill}</p>
+                              <span className="text-blue-300 text-sm font-medium flex-shrink-0 bg-slate-600 px-2 py-0.5 rounded">{drill.duration} min</span>
+                            </div>
+                        ) : null
+                      ))
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* --- TAB CONTENT: "AI COACH" --- */}
+            {activeTab === 'coach' && (
+              <section className="space-y-6">
+                <div className="bg-slate-800/60 rounded-xl border border-slate-700 shadow-xl backdrop-blur-sm h-[70vh] flex flex-col overflow-hidden"> {/* Adjusted height */}
+                  {/* Coach Header */}
+                  <header className="flex items-center gap-3 p-4 border-b border-slate-700 flex-shrink-0">
+                    <div className="w-10 h-10 md:w-12 md:h-12 bg-gradient-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center shadow">
+                      <MessageCircle className="w-5 h-5 md:w-6 md:h-6 text-white" />
+                    </div>
+                    <div>
+                      <h2 className="text-lg md:text-xl font-bold text-white">AI Football Coach</h2>
+                      <p className="text-gray-400 text-xs md:text-sm">Ask anything about techniques & training</p>
+                    </div>
+                  </header>
+
+                  {/* Chat Window */}
+                  <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar"> {/* Added scrollbar style */}
+                    {chatMessages.length === 0 ? (
+                      // Empty state
+                      <div className="text-center pt-12 pb-8">
+                        <MessageCircle className="w-16 h-16 text-gray-600 mx-auto mb-4 opacity-50" />
+                        <p className="text-gray-400 mb-5 text-sm">Ask me how to improve...</p>
+                        <div className="grid grid-cols-2 gap-3 max-w-sm mx-auto">
+                          {['Power shots', 'Finesse technique', 'Defending', 'Passing', 'Weak foot', 'Fitness'].map((topic, i) => (
+                            <button
+                              key={i}
+                              onClick={() => {
+                                  const question = `How to improve ${topic.toLowerCase()}?`;
+                                  setUserMessage(question); // Set the input field
+                                  // Send message after a tiny delay to allow input field to update visually
+                                  setTimeout(() => handleSendMessage(), 50);
+                              }}
+                              className="bg-slate-700 hover:bg-slate-600 text-gray-300 text-xs sm:text-sm py-2.5 px-3 rounded-lg transition-colors duration-150 shadow-sm"
+                            >
+                              {topic}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      // Chat history
+                      <>
+                        {chatMessages.map((msg, idx) => (
+                          <div key={`chat-${idx}`} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'}`}>
+                            <div className={`max-w-[85%] sm:max-w-[75%] p-3 rounded-lg shadow-md ${msg.type === 'user' ? 'bg-blue-600 text-white rounded-br-none' : 'bg-slate-700 text-gray-200 rounded-bl-none'}`}> {/* Bubble style */}
+                              {/* Render newlines correctly */}
+                              <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+                            </div>
+                          </div>
+                        ))}
+                        {/* Typing indicator */}
+                        {isAiTyping && (
+                          <div className="flex justify-start">
+                             <div className="bg-slate-700 text-gray-200 p-3 rounded-lg inline-flex items-center space-x-1.5 shadow-md rounded-bl-none"> {/* Bubble style + spacing */}
+                              <div className="w-1.5 h-1.5 bg-blue-400 rounded-full bounce1"></div>
+                              <div className="w-1.5 h-1.5 bg-blue-400 rounded-full bounce2"></div>
+                              <div className="w-1.5 h-1.5 bg-blue-400 rounded-full bounce3"></div>
+                            </div>
+                          </div>
+                        )}
+                        {/* Scroll anchor */}
+                        <div ref={chatEndRef} />
+                      </>
+                    )}
+                  </div>
+
+                  {/* Chat Input */}
+                  <footer className="flex gap-2 p-4 border-t border-slate-700 flex-shrink-0 bg-slate-800/50">
+                    <input
+                      type="text"
+                      value={userMessage}
+                      onChange={(e) => setUserMessage(e.target.value)} // Corrected e.taget -> e.target
+                      onKeyPress={handleKeyPress}
+                      placeholder="Ask the AI coach..."
+                       // Improved styling
+                      className="flex-1 bg-slate-700 text-white px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-400 text-sm shadow-inner"
+                    />
+                     {/* Improved styling and disabled state */}
+                    <button
+                      onClick={handleSendMessage}
+                      disabled={isAiTyping || userMessage.trim() === ''}
+                      className={`bg-blue-600 text-white px-4 sm:px-5 py-3 rounded-lg transition-colors duration-200 flex items-center justify-center shadow-md ${isAiTyping || userMessage.trim() === '' ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700'}`}
+                    >
+                      <Send className="w-4 h-4 sm:w-5 sm:h-5" /> {/* Adjusted size */}
+                    </button>
+                  </footer>
+                </div>
+              </section>
+            )}
+        </main>
+
       </div>
     </div>
   );
